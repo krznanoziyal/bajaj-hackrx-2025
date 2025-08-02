@@ -5,7 +5,6 @@ from google import genai
 from google.genai import types
 from google.genai import errors
 import requests
-import os
 from dotenv import load_dotenv
 import io
 import time
@@ -28,7 +27,6 @@ class QueryResponse(BaseModel):
     answers: List[str]
 
 class GeminiAnswers(BaseModel):
-    """A Pydantic model for the structured JSON response from the Gemini API."""
     answers: List[str] = Field(description="A list of answers to the questions, in the same order.")
 
 # --- Security ---
@@ -44,9 +42,10 @@ async def verify_token(authorization: str = Header(...)):
 async def health_check():
     return {"status": "ok"}
 
-# --- Core Endpoint ---
+# --- Endpoint ---
 @app.post("/hackrx/run", response_model=QueryResponse)
 async def process_queries(request: QueryRequest, _=Depends(verify_token)):
+    start_time = time.time()
     try:
         # 1. Download PDF
         pdf_response = requests.get(request.documents)
@@ -136,6 +135,8 @@ async def process_queries(request: QueryRequest, _=Depends(verify_token)):
         # 5. Parse JSON response and return
         parsed_json = json.loads(response.text)
         answers = parsed_json.get('answers', [])
+        duration = time.time() - start_time
+        print(f"/hackrx/run processed in {duration:.2f} seconds.")
         return QueryResponse(answers=answers)
 
     except errors.APIError as e:
