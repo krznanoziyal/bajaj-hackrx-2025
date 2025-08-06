@@ -13,7 +13,7 @@ import json
 load_dotenv()
 
 app = FastAPI()
-security = HTTPBearer()
+security = HTTPBearer(auto_error=True)
 
 # --- Configuration ---
 MODEL_NAME = "gemini-2.5-flash"
@@ -47,7 +47,18 @@ async def health_check():
 
 # --- Endpoint ---
 @app.post("/hackrx/run", response_model=QueryResponse)
-async def process_queries(request: QueryRequest, token: str = Depends(verify_token)):
+async def process_queries(
+    request: QueryRequest, 
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+):
+    # Verify the token
+    if credentials.credentials != EXPECTED_TOKEN:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid authentication token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
     start_time = time.time()
     uploaded_file = None
 
