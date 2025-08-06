@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Depends, Header
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Optional
 from google import genai
 from google.genai import types
 from google.genai import errors
@@ -29,13 +29,14 @@ class QueryResponse(BaseModel):
 class GeminiAnswers(BaseModel):
     answers: List[str] = Field(description="A list of answers to the questions, in the same order.")
 
-# --- Security ---
-async def verify_token(authorization: str = Header(...)):
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid authentication scheme")
-    token = authorization.split(" ")[1]
-    if token != EXPECTED_BEARER_TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid bearer token")
+# --- Security (Optional for Hackathon) ---
+async def verify_token(authorization: Optional[str] = Header(default=None)):
+    if authorization:
+        if not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Invalid authentication scheme")
+        token = authorization.split(" ")[1]
+        if token != EXPECTED_BEARER_TOKEN:
+            raise HTTPException(status_code=401, detail="Invalid bearer token")
 
 # --- Health Check ---
 @app.get("/health")
@@ -61,7 +62,7 @@ async def process_queries(request: QueryRequest, _=Depends(verify_token)):
     try:
         client = genai.Client()
 
-        # 2. Upload PDF to Gemini using the File API
+        # 2. Upload PDF to Gemini
         print("Uploading file to Gemini...")
         uploaded_file = client.files.upload(
             file=pdf_data,
@@ -116,14 +117,11 @@ async def process_queries(request: QueryRequest, _=Depends(verify_token)):
         CRITICAL: You must provide exactly {len(request.questions)} answers in your JSON response, one for each question above, in the same order. Each answer should directly and completely address the specific question asked.
         Return your response as a JSON object with an "answers" array containing exactly {len(request.questions)} string elements.
         """
-        
-        # 4. Generate Content with JSON response schema
+
+        # 4. Generate Content
         response = client.models.generate_content(
             model=MODEL_NAME,
-            contents=[
-                uploaded_file,
-                prompt
-            ],
+            contents=[uploaded_file, prompt],
             config=types.GenerateContentConfig(
                 response_mime_type='application/json',
                 response_schema=GeminiAnswers,
@@ -150,5 +148,3 @@ async def process_queries(request: QueryRequest, _=Depends(verify_token)):
         if uploaded_file:
             print(f"Deleting uploaded file: {uploaded_file.name}")
             client.files.delete(name=uploaded_file.name)
-
-# To run: uvicorn main:app --reload
