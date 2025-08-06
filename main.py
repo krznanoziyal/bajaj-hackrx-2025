@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from typing import List
 from google import genai
@@ -12,9 +13,11 @@ import json
 load_dotenv()
 
 app = FastAPI()
+security = HTTPBearer()
 
 # --- Configuration ---
 MODEL_NAME = "gemini-2.5-flash"
+EXPECTED_TOKEN = "bcc3195dc18ebeba6405e0a6940cc5678c76c5d26cd202f3a79524fb5e83916d"
 
 # --- Pydantic Models ---
 class QueryRequest(BaseModel):
@@ -27,6 +30,16 @@ class QueryResponse(BaseModel):
 class GeminiAnswers(BaseModel):
     answers: List[str] = Field(description="A list of answers to the questions, in the same order.")
 
+# --- Authentication ---
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if credentials.credentials != EXPECTED_TOKEN:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid authentication token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return credentials.credentials
+
 # --- Health Check ---
 @app.get("/health")
 async def health_check():
@@ -34,7 +47,7 @@ async def health_check():
 
 # --- Endpoint ---
 @app.post("/hackrx/run", response_model=QueryResponse)
-async def process_queries(request: QueryRequest):
+async def process_queries(request: QueryRequest, token: str = Depends(verify_token)):
     start_time = time.time()
     uploaded_file = None
 
