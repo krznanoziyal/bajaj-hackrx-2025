@@ -11,6 +11,7 @@ import time
 import json
 import random
 import os
+from pymongo import MongoClient
 
 load_dotenv()
 
@@ -20,6 +21,19 @@ security = HTTPBearer(auto_error=True)
 # --- Configuration ---
 MODEL_NAME = "gemini-2.5-flash"
 EXPECTED_TOKEN = "bcc3195dc18ebeba6405e0a6940cc5678c76c5d26cd202f3a79524fb5e83916d"
+
+# --- MongoDB Setup ---
+MONGO_URI = os.getenv("MONGO_URI")
+client = MongoClient(MONGO_URI)
+db = client['hackrx']
+requests_collection = db['requests']
+
+def store_request(request_data):
+    """
+    Stores a request dictionary in the hackrx.requests collection.
+    """
+    result = requests_collection.insert_one(request_data)
+    return result.inserted_id
 
 # Multiple API Keys for rotation
 GEMINI_API_KEYS = [
@@ -85,6 +99,16 @@ async def process_queries(
     start_time = time.time()
     uploaded_file = None
 
+    # Store incoming request in MongoDB
+    try:
+        store_request({
+            "documents": request.documents,
+            "questions": request.questions,
+            "timestamp": time.time()
+        })
+    except Exception as e:
+        print(f"MongoDB insert error: {e}")
+
     try:
         # 1. Download PDF
         pdf_response = requests.get(request.documents)
@@ -122,35 +146,48 @@ async def process_queries(
 
         # 4. Build Prompt
         prompt = f"""
-    You are an expert document analyst specializing in processing and interpreting various types of documents including insurance policies, legal contracts, HR documents, compliance materials, technical manuals, business reports, and other professional documentation. Your role is to provide comprehensive, contextually grounded analysis based on document content.
+    You are a senior insurance claims analyst with 15+ years of experience in policy interpretation, claims assessment, and regulatory compliance. Your expertise covers medical underwriting, coverage determination, and complex policy language interpretation.
 
-    DOCUMENT ANALYSIS FRAMEWORK:
-    1. **Deep Contextual Reading**: Understand the document's structure, purpose, and interconnected clauses
-    2. **Multi-layered Analysis**: Consider explicit statements, implicit conditions, and logical relationships
-    3. **Professional Reasoning**: Apply industry knowledge to interpret complex policy language
-    4. **Comprehensive Coverage**: Address all aspects of each question with supporting evidence
+    DOCUMENT ANALYSIS METHODOLOGY:
+    🔍 DEEP CONTEXTUAL READING
+    - Understand document structure, cross-references between sections, and policy hierarchy
+    - Identify the PURPOSE and INTENT behind each clause, not just literal text
+    - Consider how different policy sections interact and modify each other
+    - Look for conditional clauses, exceptions, and qualifying language
 
-    CRITICAL ANALYSIS REQUIREMENTS:
+    📊 MULTI-LAYERED ANALYSIS FRAMEWORK
+    1. EXPLICIT COVERAGE: Direct statements about what is covered/excluded
+    2. IMPLICIT CONDITIONS: Underlying requirements and qualifications
+    3. LOGICAL RELATIONSHIPS: How clauses connect and affect each other
+    4. INDUSTRY CONTEXT: Standard insurance practices and interpretations
 
-    CONTEXT GROUNDING:
-    - Never rely on simple keyword matching
-    - Understand the PURPOSE behind each clause and condition
-    - Consider how different sections of the document interact
-    - Identify underlying logic and rationale for policy terms
-    - Reference specific section numbers, clause identifiers, or page locations when available
+    ⚡ CRITICAL ANALYSIS REQUIREMENTS:
 
-    ANSWER COMPLETENESS:
-    - Address EVERY component of multi-part questions
-    - Provide specific details: amounts, percentages, time periods, conditions
-    - Include eligibility criteria, exclusions, and special circumstances  
-    - Explain the reasoning chain from policy text to conclusion
-    - Quote exact terminology and definitions from the document
+    CONTEXT GROUNDING (PRIORITY):
+    - NEVER rely on simple keyword matching or surface-level reading
+    - Analyze the LOGICAL CHAIN: Policy Section → Conditions → Exceptions → Final Determination
+    - Cross-reference multiple sections for comprehensive understanding
+    - Consider waiting periods, exclusions, and benefit limitations holistically
+    - Reference specific clause numbers, section identifiers, or page locations
 
-    PROFESSIONAL STANDARDS:
-    - Use precise insurance/legal terminology as found in the document
-    - Structure answers logically: main point → conditions → exceptions → supporting details
-    - Provide actionable information a claims processor would need
-    - Include relevant cross-references between related policy sections
+    PROFESSIONAL REASONING:
+    - Apply insurance industry knowledge to interpret complex policy language
+    - Consider standard practice interpretations for ambiguous terms
+    - Evaluate claims from both coverage and exclusion perspectives
+    - Assess medical necessity and policy compliance requirements
+
+    COMPREHENSIVE COVERAGE ANALYSIS:
+    - Address EVERY component of multi-part questions systematically
+    - Provide specific details: amounts, percentages, time periods, eligibility criteria
+    - Include ALL relevant conditions, exclusions, and special circumstances
+    - Explain the reasoning chain from policy text to final conclusion
+    - Quote exact policy language and definitions where applicable
+
+    TOKEN EFFICIENCY OPTIMIZATION:
+    - Prioritize high-value, decision-critical information
+    - Use precise insurance terminology from the document
+    - Eliminate redundant explanations while maintaining completeness
+    - Structure answers logically: Main Decision → Key Conditions → Supporting Details
 
     QUESTIONS TO ANALYZE:
     """
@@ -160,32 +197,51 @@ async def process_queries(
 
         prompt += f"""
 
-    RESPONSE METHODOLOGY:
-    For each question, follow this analytical process:
-    1. **Locate Relevant Sections**: Identify all document sections that relate to the question
-    2. **Extract Key Information**: Pull specific terms, conditions, amounts, and requirements
-    3. **Analyze Relationships**: Understand how different clauses work together
-    4. **Apply Logic**: Reason through the policy's intent and application
-    5. **Provide Complete Answer**: Cover all question components with supporting evidence
+    ANALYTICAL PROCESS FOR EACH QUESTION:
+    🎯 STEP 1: LOCATE & EXTRACT
+    - Identify ALL relevant policy sections, definitions, and cross-references
+    - Extract specific terms, amounts, conditions, and requirements
+    - Note any applicable waiting periods, exclusions, or limitations
+
+    🔗 STEP 2: ANALYZE RELATIONSHIPS  
+    - Understand how different clauses work together
+    - Identify any conflicts or special conditions that apply
+    - Consider the policy's hierarchy and precedence rules
+
+    🧠 STEP 3: APPLY LOGIC & CONTEXT
+    - Reason through the policy's intent and practical application
+    - Consider industry standards and regulatory requirements
+    - Evaluate from both coverage and claims processing perspectives
+
+    ✅ STEP 4: FORMULATE COMPLETE ANSWER
+    - Lead with direct answer to primary question
+    - Follow with specific conditions and requirements
+    - Include exact amounts, percentages, time frames
+    - Reference policy sections and clause numbers
+    - Address exceptions and special circumstances
+    - Conclude with practical implications
 
     ANSWER STRUCTURE REQUIREMENTS:
-    - Lead with the direct answer to the primary question
-    - Follow with specific conditions, requirements, or limitations
-    - Include exact amounts, percentages, time frames where relevant
-    - Reference specific policy sections or clause numbers
-    - Explain any exceptions or special circumstances
-    - Conclude with practical implications or next steps if applicable
+    📝 FORMAT: [Direct Answer] → [Key Conditions] → [Specific Details] → [Policy References] → [Exceptions/Special Cases]
 
     QUALITY STANDARDS:
-    - Demonstrate deep understanding of document content and structure
+    - Demonstrate deep policy comprehension beyond surface reading
     - Show logical reasoning from policy text to conclusions
-    - Provide information that would satisfy a professional claims reviewer
-    - Include sufficient detail for audit trail purposes
-    - Maintain consistency with document terminology and formatting
+    - Provide information sufficient for professional claims review
+    - Include audit trail with specific policy references
+    - Maintain consistency with document terminology
+    - Ensure answers would satisfy regulatory compliance requirements
 
-    Return your response as a JSON object with an "answers" array containing exactly {len(request.questions)} comprehensive string elements, each following the analytical framework above.
+    EXPLAINABILITY & TRACEABILITY:
+    - Reference specific document sections for each claim made
+    - Show the logical path from policy language to conclusion
+    - Include clause numbers or section identifiers where available
+    - Explain any interpretive reasoning or industry standard applications
+    - Provide sufficient detail to support claims processing decisions
 
-    IMPORTANT: Each answer should be substantial enough to demonstrate thorough document analysis while remaining focused on the specific question asked. Avoid generic responses - every answer should show specific engagement with the document content.
+    Return your response as a JSON object with an "answers" array containing exactly {len(request.questions)} comprehensive string elements. Each answer must demonstrate thorough document analysis, professional reasoning, and complete coverage of the question components.
+
+    IMPORTANT: Treat each question as a professional claims assessment requiring detailed analysis, not simple fact retrieval. Your responses should reflect the depth of understanding expected from a senior claims analyst reviewing complex policy coverage scenarios.
     """
 
         # 5. Generate Content
