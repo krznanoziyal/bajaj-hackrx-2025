@@ -5,14 +5,15 @@ from typing import List
 from google import genai
 from google.genai import types, errors
 import requests
-from dotenv import load_dotenv
+import asyncio
+import aiohttp
 import io
 import time
 import json
 import random
 import os
-from pymongo import MongoClient
-
+# from pymongo import MongoClient
+from dotenv import load_dotenv
 load_dotenv()
 
 app = FastAPI()
@@ -22,39 +23,35 @@ security = HTTPBearer(auto_error=True)
 MODEL_NAME = "gemini-2.5-flash"
 EXPECTED_TOKEN = "bcc3195dc18ebeba6405e0a6940cc5678c76c5d26cd202f3a79524fb5e83916d"
 
-# --- MongoDB Setup ---
-MONGO_URI = os.getenv("MONGO_URI")
-client = MongoClient(MONGO_URI)
-db = client['hackrx']
-requests_collection = db['requests']
-
-def store_request(request_data):
-    """
-    Stores a request dictionary in the hackrx.requests collection.
-    """
-    result = requests_collection.insert_one(request_data)
-    return result.inserted_id
-
 # Multiple API Keys for rotation
 GEMINI_API_KEYS = [
     os.getenv("GEMINI_API_KEY_1"),
     os.getenv("GEMINI_API_KEY_2"), 
     os.getenv("GEMINI_API_KEY_3")
 ]
-
-# Filter out None values in case some keys aren't set
 GEMINI_API_KEYS = [key for key in GEMINI_API_KEYS if key is not None]
 
-# If no additional keys, fall back to main key
-if not GEMINI_API_KEYS:
-    GEMINI_API_KEYS = [os.getenv("GEMINI_API_KEY")]
+# Global aiohttp session for connection pooling
+http_session = None
 
-print(f"Loaded {len(GEMINI_API_KEYS)} Gemini API keys for rotation")
+@app.on_event("startup")
+async def startup_event():
+    global http_session
+    # Create persistent HTTP session with connection pooling
+    connector = aiohttp.TCPConnector(
+        limit=100,  # Total connection limit
+        limit_per_host=30,  # Per host limit
+        keepalive_timeout=30,
+        enable_cleanup_closed=True
+    )
+    timeout = aiohttp.ClientTimeout(total=30, connect=10)
+    http_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
 
-def get_gemini_client():
-    """Get a Gemini client with a randomly selected API key"""
-    api_key = random.choice(GEMINI_API_KEYS)
-    return genai.Client(api_key=api_key)
+@app.on_event("shutdown")
+async def shutdown_event():
+    global http_session
+    if http_session:
+        await http_session.close()
 
 # --- Pydantic Models ---
 class QueryRequest(BaseModel):
@@ -77,197 +74,176 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
         )
     return credentials.credentials
 
-# --- Health Check ---
-@app.get("/health")
-async def health_check():
-    return {"status": "ok"}
-
-# --- Endpoint ---
-@app.post("/hackrx/run", response_model=QueryResponse)
-async def process_queries(
-    request: QueryRequest, 
-    credentials: HTTPAuthorizationCredentials = Depends(security)
-):
-    # Verify the token
-    if credentials.credentials != EXPECTED_TOKEN:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid authentication token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+# --- Speed-Optimized PDF Download ---
+async def download_pdf_async(url: str) -> bytes:
+    """Download PDF using async HTTP with connection pooling"""
+    global http_session
     
-    start_time = time.time()
+    try:
+        async with http_session.get(url) as response:
+            if response.status != 200:
+                raise HTTPException(status_code=400, detail=f"Failed to download PDF: HTTP {response.status}")
+            
+            content = await response.read()
+            
+            # Quick PDF validation
+            if not content.startswith(b'%PDF'):
+                raise HTTPException(status_code=400, detail="Invalid PDF document")
+                
+            return content
+    except aiohttp.ClientError as e:
+        raise HTTPException(status_code=400, detail=f"Download error: {str(e)}")
+
+# --- Optimized Prompt (Reduced Token Count) ---
+def build_speed_optimized_prompt(questions: List[str]) -> str:
+    """Build a concise, speed-focused prompt"""
+    
+    prompt = f"""You are an expert insurance analyst. Analyze the document with precision and speed.
+
+ANALYSIS METHOD:
+- Deep contextual reading beyond keywords
+- Cross-reference sections for complete understanding  
+- Apply insurance industry knowledge
+- Reference specific clauses/sections
+
+FOR EACH QUESTION:
+1. Locate relevant policy sections
+2. Analyze conditions & exclusions
+3. Apply logic & context
+4. Provide complete answer with details
+
+QUESTIONS ({len(questions)}):
+"""
+    
+    for i, q in enumerate(questions, 1):
+        prompt += f"{i}. {q}\n"
+
+    prompt += f"""
+ANSWER FORMAT: [Direct Answer] → [Key Conditions] → [Specific Details] → [Policy References]
+
+REQUIREMENTS:
+- Professional claims-level analysis
+- Include amounts, percentages, timeframes
+- Reference specific policy sections
+- Address all question components
+- Show reasoning chain from policy to conclusion
+
+Return JSON with "answers" array containing exactly {len(questions)} comprehensive responses."""
+
+    return prompt
+
+# --- Fast Gemini Processing ---
+def get_gemini_client():
+    """Get Gemini client with random API key"""
+    api_key = random.choice(GEMINI_API_KEYS)
+    return genai.Client(api_key=api_key)
+
+async def process_with_gemini(pdf_data: bytes, prompt: str, questions_count: int) -> List[str]:
+    """Process PDF with Gemini using optimized settings"""
+    
+    client = get_gemini_client()
     uploaded_file = None
-
-    # Store incoming request in MongoDB
+    
     try:
-        store_request({
-            "documents": request.documents,
-            "questions": request.questions,
-            "timestamp": time.time()
-        })
-    except Exception as e:
-        print(f"MongoDB insert error: {e}")
-
-    try:
-        # 1. Download PDF
-        pdf_response = requests.get(request.documents)
-        pdf_response.raise_for_status()
-        
-        # Check content type, but be more flexible for cloud storage services
-        content_type = pdf_response.headers.get('Content-Type', '').lower()
-        content = pdf_response.content
-        
-        # Validate it's actually a PDF by checking the file signature
-        if not content.startswith(b'%PDF'):
-            raise HTTPException(status_code=400, detail="The provided URL does not point to a valid PDF document.")
-        
-        pdf_data = io.BytesIO(content)
-
-        # 2. Upload PDF to Gemini
-        client = get_gemini_client()
+        # Upload PDF
+        pdf_io = io.BytesIO(pdf_data)
         uploaded_file = client.files.upload(
-            file=pdf_data,
+            file=pdf_io,
             config=types.UploadFileConfig(
                 mime_type='application/pdf',
-                display_name=request.documents.split('/')[-1]
+                display_name=f"doc_{int(time.time())}.pdf"
             )
         )
+        
+        # Fast polling with shorter intervals
+        max_wait = 60  # Maximum wait time
+        start_wait = time.time()
+        
+        while True:
+            file_status = client.files.get(name=uploaded_file.name)
+            
+            if file_status.state.name == 'ACTIVE':
+                break
+            elif file_status.state.name == 'FAILED':
+                error_msg = file_status.error.message if file_status.error else 'Unknown error'
+                raise HTTPException(status_code=500, detail=f"PDF processing failed: {error_msg}")
+            elif time.time() - start_wait > max_wait:
+                raise HTTPException(status_code=504, detail="PDF processing timeout")
+                
+            await asyncio.sleep(2)  # Reduced from 5 to 2 seconds
 
-        # 3. Wait for processing
-        get_file = client.files.get(name=uploaded_file.name)
-        while get_file.state.name == 'PROCESSING':
-            time.sleep(5)
-            get_file = client.files.get(name=uploaded_file.name)
-
-        if get_file.state.name == 'FAILED':
-            error_message = get_file.error.message if get_file.error else 'Unknown'
-            raise HTTPException(status_code=500, detail=f"PDF processing failed: {error_message}")
-
-        # 4. Build Prompt
-        prompt = f"""
-    You are a senior insurance claims analyst with 15+ years of experience in policy interpretation, claims assessment, and regulatory compliance. Your expertise covers medical underwriting, coverage determination, and complex policy language interpretation.
-
-    DOCUMENT ANALYSIS METHODOLOGY:
-    🔍 DEEP CONTEXTUAL READING
-    - Understand document structure, cross-references between sections, and policy hierarchy
-    - Identify the PURPOSE and INTENT behind each clause, not just literal text
-    - Consider how different policy sections interact and modify each other
-    - Look for conditional clauses, exceptions, and qualifying language
-
-    📊 MULTI-LAYERED ANALYSIS FRAMEWORK
-    1. EXPLICIT COVERAGE: Direct statements about what is covered/excluded
-    2. IMPLICIT CONDITIONS: Underlying requirements and qualifications
-    3. LOGICAL RELATIONSHIPS: How clauses connect and affect each other
-    4. INDUSTRY CONTEXT: Standard insurance practices and interpretations
-
-    ⚡ CRITICAL ANALYSIS REQUIREMENTS:
-
-    CONTEXT GROUNDING (PRIORITY):
-    - NEVER rely on simple keyword matching or surface-level reading
-    - Analyze the LOGICAL CHAIN: Policy Section → Conditions → Exceptions → Final Determination
-    - Cross-reference multiple sections for comprehensive understanding
-    - Consider waiting periods, exclusions, and benefit limitations holistically
-    - Reference specific clause numbers, section identifiers, or page locations
-
-    PROFESSIONAL REASONING:
-    - Apply insurance industry knowledge to interpret complex policy language
-    - Consider standard practice interpretations for ambiguous terms
-    - Evaluate claims from both coverage and exclusion perspectives
-    - Assess medical necessity and policy compliance requirements
-
-    COMPREHENSIVE COVERAGE ANALYSIS:
-    - Address EVERY component of multi-part questions systematically
-    - Provide specific details: amounts, percentages, time periods, eligibility criteria
-    - Include ALL relevant conditions, exclusions, and special circumstances
-    - Explain the reasoning chain from policy text to final conclusion
-    - Quote exact policy language and definitions where applicable
-
-    TOKEN EFFICIENCY OPTIMIZATION:
-    - Prioritize high-value, decision-critical information
-    - Use precise insurance terminology from the document
-    - Eliminate redundant explanations while maintaining completeness
-    - Structure answers logically: Main Decision → Key Conditions → Supporting Details
-
-    QUESTIONS TO ANALYZE:
-    """
-
-        for i, q in enumerate(request.questions):
-            prompt += f"{i+1}. {q}\n"
-
-        prompt += f"""
-
-    ANALYTICAL PROCESS FOR EACH QUESTION:
-    🎯 STEP 1: LOCATE & EXTRACT
-    - Identify ALL relevant policy sections, definitions, and cross-references
-    - Extract specific terms, amounts, conditions, and requirements
-    - Note any applicable waiting periods, exclusions, or limitations
-
-    🔗 STEP 2: ANALYZE RELATIONSHIPS  
-    - Understand how different clauses work together
-    - Identify any conflicts or special conditions that apply
-    - Consider the policy's hierarchy and precedence rules
-
-    🧠 STEP 3: APPLY LOGIC & CONTEXT
-    - Reason through the policy's intent and practical application
-    - Consider industry standards and regulatory requirements
-    - Evaluate from both coverage and claims processing perspectives
-
-    ✅ STEP 4: FORMULATE COMPLETE ANSWER
-    - Lead with direct answer to primary question
-    - Follow with specific conditions and requirements
-    - Include exact amounts, percentages, time frames
-    - Reference policy sections and clause numbers
-    - Address exceptions and special circumstances
-    - Conclude with practical implications
-
-    ANSWER STRUCTURE REQUIREMENTS:
-    📝 FORMAT: [Direct Answer] → [Key Conditions] → [Specific Details] → [Policy References] → [Exceptions/Special Cases]
-
-    QUALITY STANDARDS:
-    - Demonstrate deep policy comprehension beyond surface reading
-    - Show logical reasoning from policy text to conclusions
-    - Provide information sufficient for professional claims review
-    - Include audit trail with specific policy references
-    - Maintain consistency with document terminology
-    - Ensure answers would satisfy regulatory compliance requirements
-
-    EXPLAINABILITY & TRACEABILITY:
-    - Reference specific document sections for each claim made
-    - Show the logical path from policy language to conclusion
-    - Include clause numbers or section identifiers where available
-    - Explain any interpretive reasoning or industry standard applications
-    - Provide sufficient detail to support claims processing decisions
-
-    Return your response as a JSON object with an "answers" array containing exactly {len(request.questions)} comprehensive string elements. Each answer must demonstrate thorough document analysis, professional reasoning, and complete coverage of the question components.
-
-    IMPORTANT: Treat each question as a professional claims assessment requiring detailed analysis, not simple fact retrieval. Your responses should reflect the depth of understanding expected from a senior claims analyst reviewing complex policy coverage scenarios.
-    """
-
-        # 5. Generate Content
+        # Generate content with speed optimizations
         response = client.models.generate_content(
             model=MODEL_NAME,
             contents=[uploaded_file, prompt],
             config=types.GenerateContentConfig(
                 response_mime_type='application/json',
                 response_schema=GeminiAnswers,
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
-                maxOutputTokens=60000
+                thinking_config=types.ThinkingConfig(thinking_budget=0),  # Disable thinking for speed
+                maxOutputTokens=30000,  # Reduced from 60000
+                temperature=0.1,  # Lower temperature for faster, more deterministic responses
+                candidateCount=1,  # Only generate one candidate
+                top_p=0.8,  # Reduced for speed
+                top_k=40   # Reduced for speed
             )
         )
 
         parsed_json = json.loads(response.text)
         answers = parsed_json.get('answers', [])
+        
+        if len(answers) != questions_count:
+            # Fallback: pad with empty strings if needed
+            while len(answers) < questions_count:
+                answers.append("Unable to process this question due to processing constraints.")
+        
+        return answers[:questions_count]  # Ensure exact count
+        
+    finally:
+        # Cleanup
+        if uploaded_file:
+            try:
+                client.files.delete(name=uploaded_file.name)
+            except:
+                pass  # Ignore cleanup errors
+
+# --- Optimized Main Endpoint ---
+@app.post("/hackrx/run", response_model=QueryResponse)
+async def process_queries(
+    request: QueryRequest, 
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+):
+    start_time = time.time()
+    
+    try:
+        # Parallel operations where possible
+        pdf_download_task = download_pdf_async(request.documents)
+        prompt = build_speed_optimized_prompt(request.questions)  # Build prompt while downloading
+        
+        # Wait for PDF download
+        pdf_data = await pdf_download_task
+        
+        # Process with Gemini
+        answers = await process_with_gemini(pdf_data, prompt, len(request.questions))
+        
         duration = time.time() - start_time
-        print(f"/hackrx/run processed in {duration:.2f} seconds.")
+        print(f"Request processed in {duration:.2f} seconds")
+        
         return QueryResponse(answers=answers)
 
+    except HTTPException:
+        raise
     except errors.APIError as e:
         raise HTTPException(status_code=500, detail=f"Gemini API Error: {e.message}")
     except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="Failed to parse JSON response from the model.")
+        raise HTTPException(status_code=500, detail="Failed to parse JSON response")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
-    finally:
-        if uploaded_file:
-            client.files.delete(name=uploaded_file.name)
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
+# --- Health Check ---
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "ok", 
+        "gemini_keys": len(GEMINI_API_KEYS),
+        "optimization": "speed_focused"
+    }
