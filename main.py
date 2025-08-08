@@ -1,67 +1,117 @@
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import FastAPI, HTTPException, Depends, Header
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from google import genai
-from google.genai import types, errors
-import asyncio
+from google.genai import types
+from google.genai import errors
 import aiohttp
-import io
-import time
-import json
-import random
-import os
-import email
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-import mimetypes
-import zipfile
-import tempfile
+
 from dotenv import load_dotenv
+import io
+import asyncio
+import json
+import os
+import logging
+from contextlib import asynccontextmanager
+from itertools import cycle
+import threading
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+security = HTTPBearer()
+
+# --- Logging Configuration ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(levelname)s %(message)s',
+)
+
 load_dotenv()
 
-app = FastAPI()
-security = HTTPBearer(auto_error=True)
+# --- Custom Exceptions ---
+class DocumentDownloadError(Exception):
+    """Raised when PDF download fails"""
+    pass
+
+class DocumentProcessingTimeoutError(Exception):
+    """Raised when document processing times out"""
+    pass
+
+class FileUploadError(Exception):
+    """Raised when file upload to Gemini fails"""
+    pass
+
+class ContentGenerationError(Exception):
+    """Raised when content generation fails"""
+    pass
+
+# --- Global Variables ---
+http_session: Optional[aiohttp.ClientSession] = None
+api_keys: List[str] = []
+key_cycle = None
+key_lock = threading.Lock()
 
 # --- Configuration ---
-MODEL_NAME = "gemini-2.5-flash"
-EXPECTED_TOKEN = "bcc3195dc18ebeba6405e0a6940cc5678c76c5d26cd202f3a79524fb5e83916d"
+EXPECTED_BEARER_TOKEN = "bcc3195dc18ebeba6405e0a6940cc5678c76c5d26cd202f3a79524fb5e83916d"
+MODEL_NAME = "gemini-2.5-pro"
+PROCESSING_TIMEOUT_SECONDS = 300
+PROCESSING_POLL_INTERVAL = 2
 
-GEMINI_API_KEYS = [
-    os.getenv("GEMINI_API_KEY"),     # Base key first
-    os.getenv("GEMINI_API_KEY_1"),
-    os.getenv("GEMINI_API_KEY_2"), 
-    os.getenv("GEMINI_API_KEY_3")
-]
-GEMINI_API_KEYS = [key for key in GEMINI_API_KEYS if key is not None]
+# --- Helper Functions ---
+def load_api_keys():
+    """Load all available Gemini API keys from environment variables"""
+    keys = []
+    # Check for primary key
+    primary_key = os.getenv("GEMINI_API_KEY")
+    if primary_key:
+        keys.append(primary_key)
+    
+    # Check for additional keys
+    for i in range(1, 4):  # GEMINI_API_KEY_1, GEMINI_API_KEY_2, GEMINI_API_KEY_3
+        key = os.getenv(f"GEMINI_API_KEY_{i}")
+        if key:
+            keys.append(key)
+    
+    if not keys:
+        raise RuntimeError("No Gemini API keys found in environment variables")
+    
+    return keys
 
-if not GEMINI_API_KEYS:
-    raise ValueError("No Gemini API keys found. Please set at least GEMINI_API_KEY environment variable.")
+def get_next_api_key() -> str:
+    """Get the next API key in rotation (thread-safe)"""
+    with key_lock:
+        return next(key_cycle)
 
-print(f"Loaded {len(GEMINI_API_KEYS)} Gemini API keys for rotation")
+def create_gemini_client(api_key: str) -> genai.Client:
+    """Create a Gemini client with the specified API key"""
+    return genai.Client(api_key=api_key)
 
-# Global HTTP session
-http_session = None
-
-@app.on_event("startup")
-async def startup_event():
-    global http_session
-    connector = aiohttp.TCPConnector(
-        limit=100, limit_per_host=50, keepalive_timeout=60,
-        enable_cleanup_closed=True, use_dns_cache=True, ttl_dns_cache=300
-    )
-    timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=15)
-    http_session = aiohttp.ClientSession(
-        connector=connector, timeout=timeout,
-        headers={'User-Agent': 'MultiFormat-Processor/1.0'}
-    )
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    global http_session
+# --- Startup/Shutdown ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    global http_session, api_keys, key_cycle
+    
+    # Load API keys
+    api_keys = load_api_keys()
+    key_cycle = cycle(api_keys)
+    logging.info(f"Loaded {len(api_keys)} Gemini API keys")
+    
+    # Create HTTP session
+    timeout = aiohttp.ClientTimeout(total=300, connect=30)  # 5 min total, 30s connect
+    http_session = aiohttp.ClientSession(timeout=timeout)
+    logging.info("HTTP session created")
+    
+    yield
+    
+    # Shutdown
     if http_session:
         await http_session.close()
+        logging.info("HTTP session closed")
 
+app = FastAPI(lifespan=lifespan)
+
+# --- Pydantic Models ---
 class QueryRequest(BaseModel):
     documents: str
     questions: List[str]
@@ -70,383 +120,252 @@ class QueryResponse(BaseModel):
     answers: List[str]
 
 class GeminiAnswers(BaseModel):
-    answers: List[str] = Field(description="Professional analysis responses")
+    answers: List[str] = Field(description="A list of precise answers to the questions, in the same order.")
 
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if credentials.credentials != EXPECTED_TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    return credentials.credentials
+class HealthResponse(BaseModel):
+    status: str
+    features: List[str]
+    supported_formats: List[str]
+    active_api_keys: int
 
-# --- Document Type Detection and Processing ---
-class DocumentProcessor:
-    def __init__(self):
-        self.clients = [genai.Client(api_key=key) for key in GEMINI_API_KEYS]
-        self.client_index = 0
+class KeyTestResult(BaseModel):
+    key_index: int
+    status: str
+    error: Optional[str] = None
+
+class KeyTestResponse(BaseModel):
+    results: List[KeyTestResult]
+    total_keys: int
+    working_keys: int
+
+# --- Security ---
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Invalid authentication scheme")
+    if credentials.credentials != EXPECTED_BEARER_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid bearer token")
+
+# --- Health Check ---
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    return HealthResponse(
+        status="ok",
+        features=[
+            "Async HTTP with connection pooling",
+            "API key rotation",
+            "Granular error handling",
+            "PDF document analysis",
+            "Insurance/Policy document specialization"
+        ],
+        supported_formats=["PDF"],
+        active_api_keys=len(api_keys)
+    )
+
+# --- API Key Testing ---
+@app.get("/test-keys", response_model=KeyTestResponse)
+async def test_api_keys(_=Depends(verify_token)):
+    """Test all available Gemini API keys"""
+    results = []
+    working_keys = 0
     
-    def get_next_client(self):
-        client = self.clients[self.client_index]
-        api_key_prefix = GEMINI_API_KEYS[self.client_index][:8] + "..."
-        print(f"Using API key: {api_key_prefix}")
-        self.client_index = (self.client_index + 1) % len(self.clients)
-        return client
-    
-    async def download_document(self, url: str) -> tuple[bytes, str]:
-        """Download document and detect its type"""
-        global http_session
-        
+    for i, api_key in enumerate(api_keys):
         try:
-            async with http_session.get(url, allow_redirects=True) as response:
-                if response.status != 200:
-                    raise HTTPException(status_code=400, detail=f"Download failed: {response.status}")
-                
-                content = await response.read()
-                content_type = response.headers.get('Content-Type', '').lower()
-                
-                # Detect document type by content
-                doc_type = self.detect_document_type(content, content_type, url)
-                
-                return content, doc_type
-                
-        except asyncio.TimeoutError:
-            raise HTTPException(status_code=408, detail="Download timeout")
+            client = create_gemini_client(api_key)
+            # If we get here without exception, the key works
+            results.append(KeyTestResult(key_index=i, status="working"))
+            working_keys += 1
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Download error: {str(e)}")
+            results.append(KeyTestResult(
+                key_index=i, 
+                status="failed", 
+                error=str(e)
+            ))
     
-    def detect_document_type(self, content: bytes, content_type: str, url: str) -> str:
-        """Detect document type from content and headers"""
-        
-        # Check file signatures
-        if content.startswith(b'%PDF'):
-            return 'pdf'
-        elif content.startswith(b'PK\x03\x04'):  # ZIP-based formats
-            if b'word/' in content[:1024] or content_type.find('officedocument') != -1:
-                return 'docx'
-            elif content_type.find('document') != -1:
-                return 'docx'
-        elif content.startswith(b'\xd0\xcf\x11\xe0'):  # Old Office format
-            return 'doc'
-        elif b'From:' in content[:1000] or b'Subject:' in content[:1000]:
-            return 'email'
-        elif content_type.find('message/rfc822') != -1:
-            return 'email'
-        
-        # Check URL extension
-        url_lower = url.lower()
-        if url_lower.endswith('.pdf'):
-            return 'pdf'
-        elif url_lower.endswith('.docx'):
-            return 'docx'
-        elif url_lower.endswith('.doc'):
-            return 'doc'
-        elif url_lower.endswith('.eml') or url_lower.endswith('.msg'):
-            return 'email'
-        
-        # Default to PDF if unclear
-        return 'pdf'
-    
-    async def process_document(self, content: bytes, doc_type: str) -> tuple[str, any]:
-        """Process document based on type and upload to Gemini"""
-        
-        client = self.get_next_client()
-        uploaded_file = None
-        
-        try:
-            if doc_type == 'pdf':
-                file_name = await self._process_pdf(client, content)
-                return file_name, client
-            elif doc_type in ['docx', 'doc']:
-                file_name = await self._process_docx(client, content, doc_type)
-                return file_name, client
-            elif doc_type == 'email':
-                file_name = await self._process_email(client, content)
-                return file_name, client
-            else:
-                # Fallback: try as PDF
-                file_name = await self._process_pdf(client, content)
-                return file_name, client
-                
-        except Exception as e:
-            print(f"Document processing error ({doc_type}): {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Failed to process {doc_type}: {str(e)}")
-    
-    async def _process_pdf(self, client, content: bytes) -> str:
-        """Process PDF document"""
-        pdf_io = io.BytesIO(content)
-        
+    return KeyTestResponse(
+        results=results,
+        total_keys=len(api_keys),
+        working_keys=working_keys
+    )
+
+# --- Document Processing Functions ---
+async def download_pdf(url: str) -> bytes:
+    """Download PDF from URL using aiohttp"""
+    try:
+        async with http_session.get(url) as response:
+            if response.status != 200:
+                raise DocumentDownloadError(f"Failed to download PDF: HTTP {response.status}")
+            
+            content_type = response.headers.get('Content-Type', '')
+            if 'application/pdf' not in content_type:
+                raise DocumentDownloadError("The provided URL does not point to a PDF document.")
+            
+            return await response.read()
+    except aiohttp.ClientError as e:
+        raise DocumentDownloadError(f"Network error while downloading PDF: {str(e)}")
+    except asyncio.TimeoutError:
+        raise DocumentDownloadError("Timeout while downloading PDF")
+
+async def upload_and_process_pdf(client: genai.Client, pdf_data: bytes, filename: str) -> object:
+    """Upload PDF to Gemini and wait for processing"""
+    try:
+        # Upload file
         uploaded_file = client.files.upload(
-            file=pdf_io,
+            file=io.BytesIO(pdf_data),
             config=types.UploadFileConfig(
                 mime_type='application/pdf',
-                display_name=f"document_{int(time.time())}.pdf"
+                display_name=filename
             )
         )
         
-        print(f"PDF uploaded successfully: {uploaded_file.name}")
-        return await self._wait_for_processing(client, uploaded_file)
-    
-    async def _process_docx(self, client, content: bytes, doc_type: str) -> str:
-        """Process DOCX/DOC document"""
-        docx_io = io.BytesIO(content)
-        
-        # Determine MIME type
-        mime_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' if doc_type == 'docx' else 'application/msword'
-        
-        uploaded_file = client.files.upload(
-            file=docx_io,
-            config=types.UploadFileConfig(
-                mime_type=mime_type,
-                display_name=f"document_{int(time.time())}.{doc_type}"
-            )
-        )
-        
-        print(f"{doc_type.upper()} uploaded successfully: {uploaded_file.name}")
-        return await self._wait_for_processing(client, uploaded_file)
-    
-    async def _process_email(self, client, content: bytes) -> str:
-        """Process email document"""
-        try:
-            # Try to parse as email
-            email_content = content.decode('utf-8', errors='ignore')
-            
-            # Convert to text format for Gemini
-            email_io = io.BytesIO(email_content.encode('utf-8'))
-            
-            uploaded_file = client.files.upload(
-                file=email_io,
-                config=types.UploadFileConfig(
-                    mime_type='text/plain',
-                    display_name=f"email_{int(time.time())}.txt"
-                )
-            )
-            
-            print(f"Email uploaded successfully: {uploaded_file.name}")
-            return await self._wait_for_processing(client, uploaded_file)
-            
-        except Exception as e:
-            print(f"Email processing error: {str(e)}")
-            # Fallback: treat as text
-            text_io = io.BytesIO(content)
-            uploaded_file = client.files.upload(
-                file=text_io,
-                config=types.UploadFileConfig(
-                    mime_type='text/plain',
-                    display_name=f"document_{int(time.time())}.txt"
-                )
-            )
-            return await self._wait_for_processing(client, uploaded_file)
-    
-    async def _wait_for_processing(self, client, uploaded_file) -> str:
-        """Wait for document processing and return file reference"""
-        max_wait = 45
-        start_wait = time.time()
-        
+        # Wait for processing with timeout
+        start_time = asyncio.get_event_loop().time()
         while True:
-            # Use the SAME client for status check
-            file_status = client.files.get(name=uploaded_file.name)
+            get_file = client.files.get(name=uploaded_file.name)
             
-            if file_status.state.name == 'ACTIVE':
-                print(f"Document processed successfully: {uploaded_file.name}")
-                return uploaded_file.name
-            elif file_status.state.name == 'FAILED':
-                error_msg = file_status.error.message if file_status.error else 'Processing failed'
-                raise HTTPException(status_code=500, detail=f"Document processing failed: {error_msg}")
-            elif time.time() - start_wait > max_wait:
-                raise HTTPException(status_code=504, detail="Document processing timeout")
-                
-            await asyncio.sleep(1.5)
+            if get_file.state.name == 'ACTIVE':
+                logging.info("File processed successfully")
+                return uploaded_file
+            elif get_file.state.name == 'FAILED':
+                error_message = get_file.error.message if get_file.error else 'Unknown error'
+                raise FileUploadError(f"PDF processing failed: {error_message}")
+            
+            # Check timeout
+            elapsed = asyncio.get_event_loop().time() - start_time
+            if elapsed > PROCESSING_TIMEOUT_SECONDS:
+                raise DocumentProcessingTimeoutError(
+                    f"Document processing timed out after {PROCESSING_TIMEOUT_SECONDS} seconds"
+                )
+            
+            # Wait before next check
+            await asyncio.sleep(PROCESSING_POLL_INTERVAL)
+            
+    except errors.APIError as e:
+        raise FileUploadError(f"Failed to upload file to Gemini: {e.message}")
 
-# Global processor instance
-processor = DocumentProcessor()
+async def generate_answers(client: genai.Client, uploaded_file: object, questions: List[str]) -> List[str]:
+    """Generate answers using Gemini"""
+    # Improved prompt for insurance/policy documents
+    prompt = f"""You are an expert analyst specializing in insurance policies, legal documents, and regulatory compliance.
 
-def build_multi_format_prompt(questions: List[str], doc_type: str) -> str:
-    """Build prompt optimized for different document types"""
-    
-    doc_specific_instructions = {
-        'pdf': "This is a PDF document. Focus on policy clauses, benefit schedules, and formal contract language.",
-        'docx': "This is a Word document. May contain informal policy details, amendments, or supplementary information.",
-        'email': "This is an email document. Look for policy communications, clarifications, amendments, or coverage decisions.",
-        'doc': "This is a legacy Word document. May contain historical policy information or formal documentation."
-    }
-    
-    prompt = f"""You are a senior insurance analyst processing a {doc_type.upper()} document. {doc_specific_instructions.get(doc_type, '')}
+    DOCUMENT CONTEXT: This document contains insurance policy information, terms, conditions, coverage details, and/or regulatory compliance requirements.
 
-MULTI-FORMAT DOCUMENT ANALYSIS FRAMEWORK:
+    ANALYSIS INSTRUCTIONS:
+    - Extract information ONLY from the provided document
+    - Consider the document's and question's context and content
+    - Provide precise, factual answers
+    - Include specific details: amounts, percentages, time periods, eligibility criteria
+    - Use exact terminology from the document
+    - For coverage questions, specify what IS and IS NOT covered
+    - For procedural questions, provide step-by-step requirements
 
-🔍 DOCUMENT-SPECIFIC PROCESSING:
-- Adapt analysis approach based on document format and structure
-- Extract information from tables, schedules, email threads, or policy sections as appropriate
-- Handle format-specific elements (headers, footers, email signatures, attachments references)
-
-📊 COMPREHENSIVE CLAUSE RETRIEVAL & MATCHING:
-- Locate ALL relevant policy clauses across document sections
-- Match specific terms and conditions to query requirements
-- Cross-reference between different document sections/emails
-- Extract exact benefit amounts, percentages, and coverage limits
-
-⚖️ EXPLAINABLE DECISION RATIONALE:
-- Provide clear reasoning chain from document text to conclusion
-- Reference specific clauses, sections, email content, or table entries
-- Show how different policy components interact to determine coverage
-- Explain any conflicts and how they are resolved using policy hierarchy
-
-🎯 STRUCTURED PROFESSIONAL ANALYSIS:
-For each question, provide:
-
-📋 COVERAGE DETERMINATION: [Clear coverage decision with specifics]
-💰 BENEFIT DETAILS: [Exact amounts, percentages, limits from document]
-📝 ELIGIBILITY CONDITIONS: [All requirements that must be met]
-🚫 EXCLUSIONS/LIMITATIONS: [Specific restrictions or exceptions]
-🔍 DOCUMENT REFERENCES: [Exact locations - page numbers, section names, email dates]
-⚖️ DECISION RATIONALE: [Step-by-step reasoning showing how conclusion was reached]
-
-QUESTIONS FOR ANALYSIS:
-"""
+    QUESTIONS ({len(questions)} total):
+    """
     
     for i, q in enumerate(questions, 1):
-        prompt += f"""
-{i}. {q}
-
-ANALYSIS REQUIREMENTS:
-- Perform comprehensive clause retrieval for all relevant sections
-- Provide explainable rationale linking document evidence to conclusions
-- Include specific document references (pages/sections/email content)
-- Address all components of multi-part questions
-- Show professional reasoning chain
-
-"""
-
+        prompt += f"{i}. {q}\n"
+    
     prompt += f"""
-CRITICAL SUCCESS FACTORS:
-✓ Complete clause retrieval from document (don't miss hidden relevant sections)
-✓ Precise benefit matching with exact figures from document
-✓ Clear explainable rationale for each decision
-✓ Professional insurance expertise demonstrated
-✓ Structured response format for maximum scoring recognition
-✓ Handle document format appropriately (PDF formal vs email informal)
-
-Return JSON with "answers" array containing {len(questions)} comprehensive, professionally-structured responses with complete explainable decision rationale and precise clause matching."""
-
-    return prompt
-
-@app.post("/hackrx/run", response_model=QueryResponse)
-async def process_multi_format_queries(
-    request: QueryRequest, 
-    credentials: HTTPAuthorizationCredentials = Depends(security)
-):
-    start_time = time.time()
-    file_reference = None
-    client = None
+    RESPONSE FORMAT:
+    - Provide exactly {len(questions)} answers in the specified JSON format
+    - Each answer should be complete, accurate, and directly address the question
+    - Maintain document terminology and be concise yet comprehensive
+    - If information is not in the document, state "Information not found in document"
+    """
     
     try:
-        # Download and detect document type
-        print("Downloading and detecting document type...")
-        content, doc_type = await processor.download_document(request.documents)
-        print(f"Detected document type: {doc_type}")
-        
-        # Process document based on type - get both file reference and client
-        print(f"Processing {doc_type} document...")
-        file_reference, client = await processor.process_document(content, doc_type)
-        print(f"Document processed successfully: {file_reference}")
-        
-        # Build format-specific prompt
-        prompt = build_multi_format_prompt(request.questions, doc_type)
-        
-        # Generate response using the SAME client that uploaded the file
-        print(f"Generating content with file: {file_reference}")
-        try:
-            response = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=[client.files.get(name=file_reference), prompt],
-                config=types.GenerateContentConfig(
-                    response_mime_type='application/json',
-                    response_schema=GeminiAnswers,
-                    thinking_config=types.ThinkingConfig(thinking_budget=0),
-                    maxOutputTokens=50000,
-                    temperature=0.1,
-                    candidateCount=1,
-                    top_p=0.9,
-                    top_k=50
-                )
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=[
+                uploaded_file,
+                prompt
+            ],
+            config=types.GenerateContentConfig(
+                response_mime_type='application/json',
+                response_schema=GeminiAnswers,
+                # thinking_config=types.ThinkingConfig(thinking_budget=0),
+                maxOutputTokens=60000
             )
-        except Exception as content_error:
-            print(f"Content generation error with same client: {content_error}")
-            # If there's still an issue, try with a fresh client
-            fresh_client = processor.get_next_client()
-            response = fresh_client.models.generate_content(
-                model=MODEL_NAME,
-                contents=[fresh_client.files.get(name=file_reference), prompt],
-                config=types.GenerateContentConfig(
-                    response_mime_type='application/json',
-                    response_schema=GeminiAnswers,
-                    thinking_config=types.ThinkingConfig(thinking_budget=0),
-                    maxOutputTokens=50000,
-                    temperature=0.1,
-                    candidateCount=1,
-                    top_p=0.9,
-                    top_k=50
-                )
-            )
+        )
         
         parsed_json = json.loads(response.text)
         answers = parsed_json.get('answers', [])
         
-        # Ensure correct count
-        while len(answers) < len(request.questions):
-            answers.append("Unable to process this question completely.")
+        if len(answers) != len(questions):
+            raise ContentGenerationError(
+                f"Expected {len(questions)} answers, got {len(answers)}"
+            )
         
-        duration = time.time() - start_time
-        print(f"Multi-format request processed in {duration:.2f}s - Type: {doc_type}")
+        return answers
         
-        return QueryResponse(answers=answers[:len(request.questions)])
-        
-    except Exception as e:
-        print(f"Error processing multi-format document: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
-        
-    finally:
-        # Cleanup using the same client that uploaded the file
-        if file_reference and client:
-            try:
-                client.files.delete(name=file_reference)
-                print(f"Cleaned up file: {file_reference}")
-            except Exception as cleanup_error:
-                print(f"Cleanup error: {cleanup_error}")
-                pass
+    except errors.APIError as e:
+        raise ContentGenerationError(f"Gemini API Error: {e.message}")
+    except json.JSONDecodeError as e:
+        raise ContentGenerationError(f"Failed to parse JSON response: {str(e)}")
 
-@app.get("/health")
-async def health_check():
-    return {
-        "status": "multi_format_ready",
-        "supported_formats": ["PDF", "DOCX", "DOC", "EMAIL"],
-        "clients": len(processor.clients),
-        "features": ["clause_retrieval", "explainable_decisions", "multi_format"]
-    }
+# --- Main Endpoint ---
+@app.post("/hackrx/run", response_model=QueryResponse)
+async def process_queries(request: QueryRequest, _=Depends(verify_token)):
+    start_time = asyncio.get_event_loop().time()
+    uploaded_file = None
+    api_key = get_next_api_key()
+    client = None
+    try:
+        # 1. Download PDF
+        logging.info(f"Downloading PDF from: {request.documents}")
+        pdf_data = await download_pdf(request.documents)
+        logging.info(f"Downloaded PDF: {len(pdf_data)} bytes")
 
-@app.get("/test-keys")
-async def test_api_keys():
-    """Test each Gemini API key individually"""
-    results = []
-    
-    for i, key in enumerate(GEMINI_API_KEYS):
+        # 2. Create Gemini client and upload PDF
+        client = create_gemini_client(api_key)
+        filename = request.documents.split('/')[-1]
+        upload_start = asyncio.get_event_loop().time()
+        logging.info(f"Starting upload to Gemini at {upload_start:.2f}s")
+        uploaded_file = await upload_and_process_pdf(client, pdf_data, filename)
+        upload_end = asyncio.get_event_loop().time()
+        logging.info(f"Upload finished at {upload_end:.2f}s (duration: {upload_end-upload_start:.2f}s)")
+
+        # 3. Generate answers with retry logic
         try:
-            client = genai.Client(api_key=key)
-            # Test with a simple model list call
-            models = client.models.list()
-            results.append({
-                "key_index": i,
-                "key_prefix": key[:8] + "..." if key else "None",
-                "status": "working",
-                "models_count": len(list(models))
-            })
-        except Exception as e:
-            results.append({
-                "key_index": i,
-                "key_prefix": key[:8] + "..." if key else "None",
-                "status": "error",
-                "error": str(e)
-            })
-    
-    return {
-        "total_keys": len(GEMINI_API_KEYS),
-        "key_tests": results
-    }
+            answers = await generate_answers(client, uploaded_file, request.questions)
+        except ContentGenerationError as e:
+            logging.warning(f"Content generation failed, retrying with fresh client: {e}")
+            if len(api_keys) > 1:
+                retry_key = get_next_api_key()
+                retry_client = create_gemini_client(retry_key)
+                if uploaded_file:
+                    try:
+                        client.files.delete(name=uploaded_file.name)
+                    except:
+                        pass
+                upload_retry_start = asyncio.get_event_loop().time()
+                logging.info(f"Retrying upload to Gemini at {upload_retry_start:.2f}s")
+                uploaded_file = await upload_and_process_pdf(retry_client, pdf_data, filename)
+                upload_retry_end = asyncio.get_event_loop().time()
+                logging.info(f"Retry upload finished at {upload_retry_end:.2f}s (duration: {upload_retry_end-upload_retry_start:.2f}s)")
+                answers = await generate_answers(retry_client, uploaded_file, request.questions)
+                client = retry_client
+            else:
+                raise e
+
+        duration = asyncio.get_event_loop().time() - start_time
+        logging.info(f"/hackrx/run processed in {duration:.2f} seconds")
+        return QueryResponse(answers=answers)
+
+    except DocumentDownloadError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except (FileUploadError, DocumentProcessingTimeoutError) as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except ContentGenerationError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logging.error(f"Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+    finally:
+        if uploaded_file and client:
+            try:
+                logging.info(f"Deleting uploaded file: {uploaded_file.name}")
+                client.files.delete(name=uploaded_file.name)
+            except Exception as e:
+                logging.warning(f"Failed to delete uploaded file: {e}")
+
+# To run: uvicorn main:app --reload
