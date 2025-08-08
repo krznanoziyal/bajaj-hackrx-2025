@@ -28,11 +28,17 @@ MODEL_NAME = "gemini-2.5-flash"
 EXPECTED_TOKEN = "bcc3195dc18ebeba6405e0a6940cc5678c76c5d26cd202f3a79524fb5e83916d"
 
 GEMINI_API_KEYS = [
+    os.getenv("GEMINI_API_KEY"),     # Base key first
     os.getenv("GEMINI_API_KEY_1"),
     os.getenv("GEMINI_API_KEY_2"), 
     os.getenv("GEMINI_API_KEY_3")
 ]
 GEMINI_API_KEYS = [key for key in GEMINI_API_KEYS if key is not None]
+
+if not GEMINI_API_KEYS:
+    raise ValueError("No Gemini API keys found. Please set at least GEMINI_API_KEY environment variable.")
+
+print(f"Loaded {len(GEMINI_API_KEYS)} Gemini API keys for rotation")
 
 # Global HTTP session
 http_session = None
@@ -79,6 +85,8 @@ class DocumentProcessor:
     
     def get_next_client(self):
         client = self.clients[self.client_index]
+        api_key_prefix = GEMINI_API_KEYS[self.client_index][:8] + "..."
+        print(f"Using API key: {api_key_prefix}")
         self.client_index = (self.client_index + 1) % len(self.clients)
         return client
     
@@ -136,7 +144,7 @@ class DocumentProcessor:
         # Default to PDF if unclear
         return 'pdf'
     
-    async def process_document(self, content: bytes, doc_type: str) -> str:
+    async def process_document(self, content: bytes, doc_type: str) -> tuple[str, any]:
         """Process document based on type and upload to Gemini"""
         
         client = self.get_next_client()
@@ -144,14 +152,18 @@ class DocumentProcessor:
         
         try:
             if doc_type == 'pdf':
-                return await self._process_pdf(client, content)
+                file_name = await self._process_pdf(client, content)
+                return file_name, client
             elif doc_type in ['docx', 'doc']:
-                return await self._process_docx(client, content, doc_type)
+                file_name = await self._process_docx(client, content, doc_type)
+                return file_name, client
             elif doc_type == 'email':
-                return await self._process_email(client, content)
+                file_name = await self._process_email(client, content)
+                return file_name, client
             else:
                 # Fallback: try as PDF
-                return await self._process_pdf(client, content)
+                file_name = await self._process_pdf(client, content)
+                return file_name, client
                 
         except Exception as e:
             print(f"Document processing error ({doc_type}): {str(e)}")
@@ -169,6 +181,7 @@ class DocumentProcessor:
             )
         )
         
+        print(f"PDF uploaded successfully: {uploaded_file.name}")
         return await self._wait_for_processing(client, uploaded_file)
     
     async def _process_docx(self, client, content: bytes, doc_type: str) -> str:
@@ -186,6 +199,7 @@ class DocumentProcessor:
             )
         )
         
+        print(f"{doc_type.upper()} uploaded successfully: {uploaded_file.name}")
         return await self._wait_for_processing(client, uploaded_file)
     
     async def _process_email(self, client, content: bytes) -> str:
@@ -205,6 +219,7 @@ class DocumentProcessor:
                 )
             )
             
+            print(f"Email uploaded successfully: {uploaded_file.name}")
             return await self._wait_for_processing(client, uploaded_file)
             
         except Exception as e:
@@ -226,9 +241,11 @@ class DocumentProcessor:
         start_wait = time.time()
         
         while True:
+            # Use the SAME client for status check
             file_status = client.files.get(name=uploaded_file.name)
             
             if file_status.state.name == 'ACTIVE':
+                print(f"Document processed successfully: {uploaded_file.name}")
                 return uploaded_file.name
             elif file_status.state.name == 'FAILED':
                 error_msg = file_status.error.message if file_status.error else 'Processing failed'
@@ -318,6 +335,7 @@ async def process_multi_format_queries(
 ):
     start_time = time.time()
     file_reference = None
+    client = None
     
     try:
         # Download and detect document type
@@ -325,30 +343,49 @@ async def process_multi_format_queries(
         content, doc_type = await processor.download_document(request.documents)
         print(f"Detected document type: {doc_type}")
         
-        # Process document based on type
+        # Process document based on type - get both file reference and client
         print(f"Processing {doc_type} document...")
-        file_reference = await processor.process_document(content, doc_type)
+        file_reference, client = await processor.process_document(content, doc_type)
         print(f"Document processed successfully: {file_reference}")
         
         # Build format-specific prompt
         prompt = build_multi_format_prompt(request.questions, doc_type)
         
-        # Generate response
-        client = processor.get_next_client()
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=[client.files.get(name=file_reference), prompt],
-            config=types.GenerateContentConfig(
-                response_mime_type='application/json',
-                response_schema=GeminiAnswers,
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
-                maxOutputTokens=50000,
-                temperature=0.1,
-                candidateCount=1,
-                top_p=0.9,
-                top_k=50
+        # Generate response using the SAME client that uploaded the file
+        print(f"Generating content with file: {file_reference}")
+        try:
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=[client.files.get(name=file_reference), prompt],
+                config=types.GenerateContentConfig(
+                    response_mime_type='application/json',
+                    response_schema=GeminiAnswers,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    maxOutputTokens=50000,
+                    temperature=0.1,
+                    candidateCount=1,
+                    top_p=0.9,
+                    top_k=50
+                )
             )
-        )
+        except Exception as content_error:
+            print(f"Content generation error with same client: {content_error}")
+            # If there's still an issue, try with a fresh client
+            fresh_client = processor.get_next_client()
+            response = fresh_client.models.generate_content(
+                model=MODEL_NAME,
+                contents=[fresh_client.files.get(name=file_reference), prompt],
+                config=types.GenerateContentConfig(
+                    response_mime_type='application/json',
+                    response_schema=GeminiAnswers,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    maxOutputTokens=50000,
+                    temperature=0.1,
+                    candidateCount=1,
+                    top_p=0.9,
+                    top_k=50
+                )
+            )
         
         parsed_json = json.loads(response.text)
         answers = parsed_json.get('answers', [])
@@ -367,12 +404,13 @@ async def process_multi_format_queries(
         raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
         
     finally:
-        # Cleanup
-        if file_reference:
+        # Cleanup using the same client that uploaded the file
+        if file_reference and client:
             try:
-                client = processor.get_next_client()
                 client.files.delete(name=file_reference)
-            except:
+                print(f"Cleaned up file: {file_reference}")
+            except Exception as cleanup_error:
+                print(f"Cleanup error: {cleanup_error}")
                 pass
 
 @app.get("/health")
@@ -382,4 +420,33 @@ async def health_check():
         "supported_formats": ["PDF", "DOCX", "DOC", "EMAIL"],
         "clients": len(processor.clients),
         "features": ["clause_retrieval", "explainable_decisions", "multi_format"]
+    }
+
+@app.get("/test-keys")
+async def test_api_keys():
+    """Test each Gemini API key individually"""
+    results = []
+    
+    for i, key in enumerate(GEMINI_API_KEYS):
+        try:
+            client = genai.Client(api_key=key)
+            # Test with a simple model list call
+            models = client.models.list()
+            results.append({
+                "key_index": i,
+                "key_prefix": key[:8] + "..." if key else "None",
+                "status": "working",
+                "models_count": len(list(models))
+            })
+        except Exception as e:
+            results.append({
+                "key_index": i,
+                "key_prefix": key[:8] + "..." if key else "None",
+                "status": "error",
+                "error": str(e)
+            })
+    
+    return {
+        "total_keys": len(GEMINI_API_KEYS),
+        "key_tests": results
     }
